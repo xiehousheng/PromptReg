@@ -18,18 +18,18 @@ More details can be found in our [paper](https://link.springer.com/chapter/10.10
 - `PromptReg.py` — PromptReg Model.
 
 ## 🧰 Data Preparation
-Set `data_root` in `promptreg/train.py`. Each task folder needs `csv/train.csv` and `csv/test.csv` with columns:
+Set `data_root` in `train.py`. Each task folder needs `csv/train.csv` and `csv/test.csv` with columns:
 - `moving_image`, `moving_label`
 - `fixed_image`, `fixed_label`
 
 ## 🏋️ Training
-1) Edit `promptreg/train.py` to set:
+1) Edit `train.py` to set:
 - `data_root`: dataset root directory
 - `save_dir`: directory to store checkpoints (auto-save every 30 epochs)
 
 2) Run:
-```bash
-CUDA_VISIBLE_DEVICES=0 python promptreg/train.py \
+```
+python train.py \
   --gpu 0 \
   --batch-size 1 \
   --epochs 300 \
