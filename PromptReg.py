@@ -307,7 +307,7 @@ class PromptGenerator(nn.Module):
             similarities.append(similarity)
         
         similarities = torch.stack(similarities, dim=1)
-        temperature = 1
+        temperature = 0.5
         similarities = similarities / temperature
         return F.softmax(similarities, dim=1)
     
@@ -340,34 +340,46 @@ class PromptGenerator(nn.Module):
 class PromptReg(nn.Module):
     def __init__(self, inshape=(160,160,160), in_channel=1, channels=16, task_total_number=3):
         super(PromptReg, self).__init__()
-        self.channels = channels
-        self.inshape = inshape
-        self.task_total_number = task_total_number
-        
-        c = self.channels
-        self.encoder_moving = Encoder(in_channel=in_channel, first_out_channel=c)
-        self.encoder_fixed = Encoder(in_channel=in_channel, first_out_channel=c)
-        
+        c = channels
         # Task prompts
         self.prompt_generator = PromptGenerator(16*c, task_total_number,c,inshape)
       
-        self.fusion_layer = nn.Sequential(
-            ConvInsBlock(16*c, 8*c, 3, 1),  
-            ConvInsBlock(8*c, 8*c, 3, 1)
-        ) 
         self.prompt_fusion_layer = nn.Sequential(
             ConvInsBlock(16*c, 8*c, 3, 1), 
             ConvInsBlock(8*c, 8*c, 3, 1)
         )
         
- 
-        self.task_criterion = nn.CrossEntropyLoss()
-        self.similarity_criterion = nn.BCELoss()
         
+        self.channels = channels
+        self.step = 7
+        self.inshape = inshape
+
+        self.encoder_moving = Encoder(in_channel=in_channel, first_out_channel=c)
+        self.encoder_fixed = Encoder(in_channel=in_channel, first_out_channel=c)
+
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.upsample_trilin = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)#nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)
+
+
+        self.warp = nn.ModuleList()
+        self.diff = nn.ModuleList()
+        for i in range(4):
+            self.warp.append(SpatialTransformer([s // 2**i for s in inshape]))
+            self.diff.append(VecInt([s // 2**i for s in inshape]))
+            
+        # bottleNeck
+        self.cconv_4 = nn.Sequential(
+            ConvInsBlock(16 * c, 8 * c, 3, 1),
+            ConvInsBlock(8 * c, 8 * c, 3, 1)
+        )
         # warp scale 2
         self.defconv4 = nn.Conv3d(8*c, 3, 3, 1, 1)
         self.defconv4.weight = nn.Parameter(Normal(0, 1e-5).sample(self.defconv4.weight.shape))
         self.defconv4.bias = nn.Parameter(torch.zeros(self.defconv4.bias.shape))
+        self.dconv4 = nn.Sequential(
+            ConvInsBlock(3*8*c, 8*c),
+            ConvInsBlock(8*c, 8*c)
+        )
         
         self.upconv3 = UpConvBlock(8*c, 4*c, 4, 2)
         self.cconv_3 = CConv(3*4*c)
@@ -376,6 +388,7 @@ class PromptReg(nn.Module):
         self.defconv3 = nn.Conv3d(3*4*c, 3, 3, 1, 1)
         self.defconv3.weight = nn.Parameter(Normal(0, 1e-5).sample(self.defconv3.weight.shape))
         self.defconv3.bias = nn.Parameter(torch.zeros(self.defconv3.bias.shape))
+        self.dconv3 = ConvInsBlock(3 * 4 * c, 4 * c)
         
         self.upconv2 = UpConvBlock(3*4*c, 2*c, 4, 2)
         self.cconv_2 = CConv(3*2*c)
@@ -384,6 +397,7 @@ class PromptReg(nn.Module):
         self.defconv2 = nn.Conv3d(3*2*c, 3, 3, 1, 1)
         self.defconv2.weight = nn.Parameter(Normal(0, 1e-5).sample(self.defconv2.weight.shape))
         self.defconv2.bias = nn.Parameter(torch.zeros(self.defconv2.bias.shape))
+        self.dconv2 = ConvInsBlock(3 * 2 * c, 2 * c)
         
         self.upconv1 = UpConvBlock(3*2*c, c, 4, 2)
         self.cconv_1 = CConv(3*c)
@@ -393,50 +407,66 @@ class PromptReg(nn.Module):
         self.defconv1.weight = nn.Parameter(Normal(0, 1e-5).sample(self.defconv1.weight.shape))
         self.defconv1.bias = nn.Parameter(torch.zeros(self.defconv1.bias.shape))
 
-        self.upsample_trilin = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)
-
-        self.warp = nn.ModuleList()
-        self.diff = nn.ModuleList()
-        for i in range(4):
-            self.warp.append(SpatialTransformer([s // 2**i for s in inshape]))
-            self.diff.append(VecInt([s // 2**i for s in inshape]))
-
+ 
+   
     def forward(self, moving, fixed, task_id,is_training=False):
-       
-        c=16
+
+        # encode stage
         M1, M2, M3, M4 = self.encoder_moving(moving)
         F1, F2, F3, F4 = self.encoder_fixed(fixed)
-   
-        C4 = torch.cat([F4, M4], dim=1)  # [bs, 16c, H/8, W/8, D/8]
-        C4 = self.fusion_layer(C4) 
-   
+        # c=16, 2c, 4c, 8c  # 160, 80, 40, 20
+
+        # first dec layer
+        C4 = torch.cat([F4, M4], dim=1)
+        C4 = self.cconv_4(C4)  # (1,128,20,24,20)
+
         task_prompt, similarity_loss, orthogonal_loss = self.prompt_generator(C4, task_id, is_training)
-        
-   
+
         C4 = torch.cat([C4, task_prompt], dim=1)  # [bs, 16c, H/8, W/8, D/8]
-        C4 = self.prompt_fusion_layer(C4)  # [bs, 8c, H/8, W/8, D/8]
-        
+        C4 = self.prompt_fusion_layer(C4)
+
         flow = self.defconv4(C4)  # (1,3,20,24,20)
         flow = self.diff[3](flow)
+        warped = self.warp[3](M4, flow)
+        C4 = self.dconv4(torch.cat([F4, warped, C4], dim=1))
+        v = self.defconv4(C4)  # (1,3,20,24,20)
+        w = self.diff[3](v)
+
 
         D3 = self.upconv3(C4)   # (1, 64, 40, 48, 40)
-        flow = self.upsample_trilin(2*flow)
+        flow = self.upsample_trilin(2*(self.warp[3](flow, w)+w))
         warped = self.warp[2](M3, flow)  # (1, 64, 40, 48, 40)
         C3 = self.cconv_3(F3, warped, D3)  #  (1, 3 * 64, 40, 48, 40)
         v = self.defconv3(C3)
         w = self.diff[2](v)
         flow = self.warp[2](flow, w)+w
+        warped = self.warp[2](M3, flow)  # (1, 64, 40, 48, 40)
+        D3 = self.dconv3(C3)
+        C3 = self.cconv_3(F3, warped, D3)  #  (1, 3 * 64, 40, 48, 40)
+        v = self.defconv3(C3)
+        w = self.diff[2](v)
 
         D2 = self.upconv2(C3)
-        flow = self.upsample_trilin(2*flow)
+        flow = self.upsample_trilin(2*(self.warp[2](flow, w)+w))
         warped = self.warp[1](M2, flow)
         C2 = self.cconv_2(F2, warped, D2)
         v = self.defconv2(C2)  # (1,3,80,96,80)
         w = self.diff[1](v)
         flow = self.warp[1](flow, w)+w
+        warped = self.warp[1](M2, flow)
+        D2 = self.dconv2(C2)
+        C2 = self.cconv_2(F2, warped, D2)
+        v = self.defconv2(C2)  # (1,3,80,96,80)
+        w = self.diff[1](v)
+        flow = self.warp[1](flow, w)+w
+        warped = self.warp[1](M2, flow)
+        D2 = self.dconv2(C2)
+        C2 = self.cconv_2(F2, warped, D2)
+        v = self.defconv2(C2)  # (1,3,80,96,80)
+        w = self.diff[1](v)
 
         D1 = self.upconv1(C2)  # (1,16,160,196,160)
-        flow = self.upsample_trilin(2*flow)  # （1,3,160,196,160)
+        flow = self.upsample_trilin(2*(self.warp[1](flow, w)+w))  # （1,3,160,196,160)
         warped = self.warp[0](M1, flow)  # （1,16,160,196,160)
         C1 = self.cconv_1(F1, warped, D1)  # （1,48,160,196,160)
         v = self.defconv1(C1)
